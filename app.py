@@ -8,119 +8,115 @@ import time
 
 # 1. 보안 설정 (Secrets에서 키 불러오기)
 try:
+    # image_af967b.png의 설정값 확인
     DEFAULT_API_KEY = st.secrets["molit_api_key"]
 except:
     DEFAULT_API_KEY = ""
 
-# 2. 지역 코드 로드 및 전처리 (사용자 CSV 규격 맞춤)
+# 2. 지역 코드 로드 (image_af13f0.png 규격 반영)
 @st.cache_data
 def load_region_codes():
-    try:
-        # 인코딩 에러 방지를 위해 cp949 시도 후 utf-8 시도
+    for enc in ['cp949', 'utf-8', 'euc-kr']:
         try:
-            df = pd.read_csv("region_codes.csv", encoding='cp949')
+            df = pd.read_csv("region_codes.csv", encoding=enc)
+            # 법정동명에서 시도/시군구 분리 로직 정교화
+            df = df[df['폐지여부'] == '존재'].copy()
+            df = df[df['법정동명'].str.contains(' ')].copy()
+            df['sido'] = df['법정동명'].apply(lambda x: x.split()[0])
+            df['sigungu'] = df['법정동명'].apply(lambda x: x.split()[1])
+            # 5자리 코드 생성 (앞 5글자)
+            df['code'] = df['법정동코드'].astype(str).str[:5]
+            return df[['sido', 'sigungu', 'code']].drop_duplicates()
         except:
-            df = pd.read_csv("region_codes.csv", encoding='utf-8')
-            
-        df = df[df['폐지여부'] == '존재'].copy()
-        # 법정동명에서 시도와 시군구 추출 (예: 서울특별시 종로구)
-        df['sido'] = df['법정동명'].apply(lambda x: x.split()[0] if len(x.split()) > 0 else "")
-        df['sigungu'] = df['법정동명'].apply(lambda x: x.split()[1] if len(x.split()) > 1 else "")
-        
-        # 5자리 시군구 코드 생성 (법정동코드 앞 5자리)
-        df['code'] = df['법정동코드'].astype(str).str[:5]
-        
-        # 시군구가 있는 데이터만 중복 제거하여 반환
-        return df[df['sigungu'] != ""].drop_duplicates(['sido', 'sigungu'])
-    except Exception as e:
-        st.error(f"지역 코드 파일 로드 에러: {e}")
-        return pd.DataFrame()
+            continue
+    return pd.DataFrame()
 
+# 3. 데이터 수집 및 진단 함수
 def get_molit_data(key, code, ymd):
     url = 'http://openapi.molit.go.kr/OpenAPI_ToolInstallPackage/service/rest/RTMSOBJSvc/getRTMSDataSvcAptTradeDev'
     params = {'serviceKey': key, 'LAWD_CD': code, 'DEAL_YMD': ymd}
     try:
-        res = requests.get(url, params=params, timeout=10)
+        res = requests.get(url, params=params, timeout=15)
+        
+        # 진단 모드: API 응답 결과 파싱
         root = ET.fromstring(res.content)
+        header = root.find(".//header")
+        result_code = header.findtext("resultCode")
+        result_msg = header.findtext("resultMsg")
+        
+        # 에러 발생 시 알림
+        if result_code != "00":
+            st.error(f"⚠️ API 서버 응답 오류: {result_msg} (코드: {result_code})")
+            return pd.DataFrame(), result_msg
+            
         items = []
         for item in root.findall('.//item'):
             items.append({child.tag: child.text for child in item})
-        return pd.DataFrame(items)
-    except:
-        return pd.DataFrame()
+            
+        return pd.DataFrame(items), "정상"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
 
 # --- UI 구성 ---
 st.set_page_config(page_title="아파트 실거래 벌크 수집기", layout="wide")
-st.title("📑 아파트 실거래가 전국 다중 수집 시스템")
+st.title("📑 전국 아파트 실거래 데이터 수집 시스템")
 
 region_df = load_region_codes()
 
 with st.sidebar:
-    st.header("🔑 기본 설정")
-    user_api_key = st.text_input("API 인증키", value=DEFAULT_API_KEY, type="password")
+    st.header("🔑 API 설정")
+    user_api_key = st.text_input("인증키 (Decoding)", value=DEFAULT_API_KEY, type="password")
     
-    st.divider()
-    st.header("📍 지역 다중 선택")
     if not region_df.empty:
-        # 1. 시/도 다중 선택
-        all_sidos = sorted(region_df['sido'].unique())
-        selected_sidos = st.multiselect("시/도 선택", all_sidos, default=["인천광역시"])
+        st.header("📍 지역 선택")
+        sido_list = sorted(region_df['sido'].unique())
+        sel_sidos = st.multiselect("시/도", sido_list, default=["인천광역시"])
         
-        # 2. 선택된 시/도 내 시/군/구 필터링
-        filtered_df = region_df[region_df['sido'].isin(selected_sidos)]
-        sigungu_options = sorted(filtered_df['sigungu'].unique())
+        filtered = region_df[region_df['sido'].isin(sel_sidos)]
+        sigungu_opts = sorted(filtered['sigungu'].unique())
         
-        select_all = st.checkbox("선택한 시/도의 모든 구 포함")
-        if select_all:
-            selected_sigungus = sigungu_options
-        else:
-            selected_sigungus = st.multiselect("시/군/구 선택", sigungu_options)
+        sel_all = st.checkbox("선택한 시/도의 모든 구 포함")
+        sel_sigungus = sigungu_opts if sel_all else st.multiselect("시/군/구", sigungu_opts)
 
-    st.divider()
-    st.header("📅 기간 선택 (최대 12개월)")
-    # 최근 12개월 월 리스트 생성
-    curr = datetime.now()
-    month_list = [(curr - timedelta(days=30*i)).strftime("%Y%m") for i in range(12)]
-    selected_months = st.multiselect("조회 월 선택", sorted(month_list, reverse=True), default=[month_list[1]])
+    st.header("📅 기간 선택")
+    # 2026년 2월은 데이터가 없으므로 2025년 위주로 선택 권장
+    month_list = ["202601", "202512", "202511", "202510", "202509", "202508"]
+    sel_months = st.multiselect("조회 월 (과거 데이터 권장)", month_list, default=["202601", "202512"])
 
-# 메인 실행 버튼
-if st.button("🚀 데이터 수집 시작 (다중 호출)"):
+if st.button("🚀 데이터 수집 시작"):
     if not user_api_key:
         st.error("API 키를 입력해주세요.")
-    elif not selected_sigungus:
-        st.warning("지역을 선택해주세요.")
     else:
-        # 선택된 시군구에 해당하는 5자리 코드 리스트 추출
-        target_df = region_df[region_df['sigungu'].isin(selected_sigungus)]
-        target_codes = target_df['code'].unique()
+        target_codes = region_df[region_df['sigungu'].isin(sel_sigungus)]['code'].unique()
+        all_dfs = []
         
-        total_steps = len(target_codes) * len(selected_months)
-        progress_bar = st.progress(0)
-        all_results = []
+        bar = st.progress(0)
+        total = len(target_codes) * len(sel_months)
+        cnt = 0
         
-        step = 0
-        for ymd in selected_months:
+        for ymd in sel_months:
             for code in target_codes:
-                step += 1
-                local_name = target_df[target_df['code'] == code]['sigungu'].values[0]
-                st.write(f"⏳ {local_name} ({ymd}) 데이터 가져오는 중...")
+                cnt += 1
+                name = region_df[region_df['code'] == code]['sigungu'].values[0]
+                status = st.empty()
+                status.text(f"⏳ {name} ({ymd}) 데이터 확인 중...")
                 
-                df_temp = get_molit_data(user_api_key, code, ymd)
-                if not df_temp.empty:
-                    all_results.append(df_temp)
+                df_tmp, msg = get_molit_data(user_api_key, code, ymd)
+                if not df_tmp.empty:
+                    all_dfs.append(df_tmp)
                 
-                progress_bar.progress(step / total_steps)
-                time.sleep(0.2) # API 과부하 방지
+                bar.progress(cnt / total)
+                time.sleep(0.3) # 서버 과부하 방지
         
-        if all_results:
-            final_df = pd.concat(all_results, ignore_index=True)
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True)
             st.success(f"✅ 총 {len(final_df)}건 수집 완료!")
-            st.dataframe(final_df, use_container_width=True)
+            st.dataframe(final_df)
             
             # 엑셀 다운로드
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 final_df.to_excel(writer, index=False)
-            st.download_button("💾 전체 데이터 엑셀 다운로드", output.getvalue(), "apt_bulk_data.xlsx")
+            st.download_button("💾 전체 데이터 다운로드", output.getvalue(), "apt_data.xlsx")
         else:
-            st.error("수집된 데이터가 없습니다. API 승인 후 1~2시간이 지났는지 확인해 보세요.")
+            st.warning("데이터를 가져오지 못했습니다. 위쪽의 에러 메시지를 확인하거나 더 과거의 달(예: 202512)을 선택해 보세요.")
